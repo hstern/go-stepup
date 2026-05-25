@@ -1,0 +1,18 @@
+# IDE / editor caches
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local working files
+prompt.txt
+
+# Build / test outputs
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspaces
+go.work
+go.work.sum
