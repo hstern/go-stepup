@@ -5,6 +5,7 @@ package stepup
 
 import (
 	"errors"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -806,5 +807,234 @@ func TestParseMaxAgeErrorPosition(t *testing.T) {
 	if perr.Position < bearerAt {
 		t.Errorf("Parse(%q) reported position %d, want >= %d (inside the Bearer challenge)",
 			in, perr.Position, bearerAt)
+	}
+}
+
+// TestParseHeader covers the dispatch-and-filter layer that sits on top
+// of the per-value parser exercised by TestParse. The cases here focus
+// on what ParseHeader adds: walking every WWW-Authenticate header line,
+// filtering to Bearer challenges that carry
+// error="insufficient_user_authentication", and preserving
+// header-then-source order in the returned slice. Per-challenge field
+// mapping is already locked in by TestParse; the cases below construct
+// minimal challenges and assert the contract on which ones survive the
+// filter, in what order, with what fields populated.
+func TestParseHeader(t *testing.T) {
+	t.Parallel()
+
+	// stepup builds a one-Bearer-step-up challenge with the given
+	// realm; using a helper keeps the table cases short and the
+	// expected values obvious.
+	stepup := func(realm string) *Challenge {
+		return &Challenge{
+			Realm:     realm,
+			ErrorCode: ErrorInsufficientUserAuthentication,
+		}
+	}
+
+	cases := []struct {
+		name   string
+		header http.Header
+		want   []*Challenge
+	}{
+		{
+			// Zero-value http.Header: no WWW-Authenticate
+			// present at all, nil slice on the way out.
+			name:   "empty header",
+			header: http.Header{},
+			want:   nil,
+		},
+		{
+			// Header set, but no WWW-Authenticate key. The
+			// canonical-MIME-form lookup misses cleanly.
+			name: "no WWW-Authenticate present",
+			header: http.Header{
+				"Content-Type": {"application/json"},
+			},
+			want: nil,
+		},
+		{
+			// RFC 9470 §3 verbatim example. Sets the typed
+			// fields the table will exercise asymmetrically
+			// in later cases — Realm, ErrorCode,
+			// ErrorDescription, ACRValues.
+			name: "single Bearer step-up challenge",
+			header: http.Header{
+				"Www-Authenticate": {
+					`Bearer realm="example", error="insufficient_user_authentication", error_description="Multi-factor authentication required", acr_values="myACR"`,
+				},
+			},
+			want: []*Challenge{
+				{
+					Realm:            "example",
+					ErrorCode:        ErrorInsufficientUserAuthentication,
+					ErrorDescription: "Multi-factor authentication required",
+					ACRValues:        []string{"myACR"},
+				},
+			},
+		},
+		{
+			// Bearer challenge carrying a non-RFC-9470 error
+			// code is filtered out. This is the implementer
+			// pin: ParseHeader is RFC 9470 only, even though
+			// Parse would happily return this challenge.
+			name: "Bearer with wrong error code filtered out",
+			header: http.Header{
+				"Www-Authenticate": {`Bearer realm="x", error="invalid_token"`},
+			},
+			want: nil,
+		},
+		{
+			// Bearer with no error code at all is also
+			// filtered out — ErrorCode == "" does not equal
+			// ErrorInsufficientUserAuthentication.
+			name: "Bearer with no error code filtered out",
+			header: http.Header{
+				"Www-Authenticate": {`Bearer realm="x"`},
+			},
+			want: nil,
+		},
+		{
+			// Mixed schemes in one header value: only the
+			// Bearer step-up challenge passes. Basic is not a
+			// Bearer scheme; the source-order Basic-then-Bearer
+			// is preserved in scanBearerChallenges but Basic
+			// drops at the scheme check.
+			name: "mixed schemes — only Bearer step-up returned",
+			header: http.Header{
+				"Www-Authenticate": {
+					`Basic realm="x", Bearer realm="y", error="insufficient_user_authentication"`,
+				},
+			},
+			want: []*Challenge{stepup("y")},
+		},
+		{
+			// Multiple header LINES: http.Header.Values walks
+			// them in stored order. Two separate lines, each
+			// one Bearer step-up challenge, yield two
+			// Challenges in header-line order.
+			name: "multiple WWW-Authenticate header lines",
+			header: func() http.Header {
+				h := http.Header{}
+				h.Add("WWW-Authenticate", `Bearer realm="a", error="insufficient_user_authentication"`)
+				h.Add("WWW-Authenticate", `Bearer realm="b", error="insufficient_user_authentication"`)
+				return h
+			}(),
+			want: []*Challenge{stepup("a"), stepup("b")},
+		},
+		{
+			// Multiple Bearer step-up challenges in ONE header
+			// value, comma-separated. Source order preserved.
+			name: "multiple challenges in one header value",
+			header: http.Header{
+				"Www-Authenticate": {
+					`Bearer realm="a", error="insufficient_user_authentication", Bearer realm="b", error="insufficient_user_authentication"`,
+				},
+			},
+			want: []*Challenge{stepup("a"), stepup("b")},
+		},
+		{
+			// Combination: two header lines, each carrying two
+			// Bearer step-up challenges. Result is
+			// header-then-source order: (line1-ch1, line1-ch2,
+			// line2-ch1, line2-ch2).
+			name: "multi-line and multi-challenge combined",
+			header: func() http.Header {
+				h := http.Header{}
+				h.Add("WWW-Authenticate", `Bearer realm="a", error="insufficient_user_authentication", Bearer realm="b", error="insufficient_user_authentication"`)
+				h.Add("WWW-Authenticate", `Bearer realm="c", error="insufficient_user_authentication", Bearer realm="d", error="insufficient_user_authentication"`)
+				return h
+			}(),
+			want: []*Challenge{stepup("a"), stepup("b"), stepup("c"), stepup("d")},
+		},
+		{
+			// Three header lines exercising every drop reason:
+			// the first survives (Bearer + step-up), the
+			// second is dropped on scheme (Basic), the third
+			// is dropped on error-code mismatch (Bearer +
+			// invalid_token). Only one Challenge comes back.
+			name: "mixed valid and filtered-out across header lines",
+			header: func() http.Header {
+				h := http.Header{}
+				h.Add("WWW-Authenticate", `Bearer realm="keep", error="insufficient_user_authentication"`)
+				h.Add("WWW-Authenticate", `Basic realm="drop"`)
+				h.Add("WWW-Authenticate", `Bearer realm="drop", error="invalid_token"`)
+				return h
+			}(),
+			want: []*Challenge{stepup("keep")},
+		},
+		{
+			// http.Header.Values canonicalizes the key to MIME
+			// form ("Www-Authenticate"), so a lowercase Set
+			// surfaces just the same. Locks in that the
+			// implementation uses Values rather than direct
+			// map indexing.
+			name: "case-insensitive header name lookup",
+			header: func() http.Header {
+				h := http.Header{}
+				h.Set("www-authenticate", `Bearer realm="x", error="insufficient_user_authentication"`)
+				return h
+			}(),
+			want: []*Challenge{stepup("x")},
+		},
+		{
+			// Pure non-Bearer / non-step-up traffic: a Basic
+			// challenge alongside a Bearer challenge with the
+			// wrong error code. Neither survives the filter;
+			// the call returns (nil, nil).
+			name: "all non-Bearer or non-step-up returns nil",
+			header: func() http.Header {
+				h := http.Header{}
+				h.Add("WWW-Authenticate", `Basic realm="x"`)
+				h.Add("WWW-Authenticate", `Bearer realm="y", error="insufficient_scope"`)
+				return h
+			}(),
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := ParseHeader(tc.header)
+			if err != nil {
+				t.Fatalf("ParseHeader(%v) returned error: %v", tc.header, err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("ParseHeader(%v)\n got:  %#v\n want: %#v",
+					tc.header, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseHeaderErrorAborts pins the "fail fast on first grammar
+// violation" behavior — when one header value is malformed, ParseHeader
+// returns (nil, *ParseError) immediately rather than skipping the bad
+// line and returning a partial result. The alternative would silently
+// lose data the caller may need to act on.
+func TestParseHeaderErrorAborts(t *testing.T) {
+	t.Parallel()
+
+	// First header line is a valid step-up challenge that WOULD have
+	// passed the filter; second line is malformed (unterminated
+	// quoted-string in realm). The good challenge from line 1 must
+	// NOT appear in the result — the whole call fails.
+	h := http.Header{}
+	h.Add("WWW-Authenticate", `Bearer realm="good", error="insufficient_user_authentication"`)
+	h.Add("WWW-Authenticate", `Bearer realm="oops`)
+
+	got, err := ParseHeader(h)
+	if err == nil {
+		t.Fatalf("ParseHeader returned (%v, nil), want (nil, *ParseError)", got)
+	}
+	if got != nil {
+		t.Errorf("ParseHeader returned non-nil challenges %#v alongside error %v; want nil slice on error",
+			got, err)
+	}
+	var perr *ParseError
+	if !errors.As(err, &perr) {
+		t.Fatalf("ParseHeader returned %T, want *ParseError: %v", err, err)
 	}
 }
