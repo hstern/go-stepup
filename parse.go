@@ -4,8 +4,201 @@
 package stepup
 
 import (
+	"errors"
+	"strconv"
 	"strings"
 )
+
+// Parse parses a single WWW-Authenticate header value into a Challenge.
+//
+// The header value MAY contain multiple challenges separated by commas
+// (RFC 7235 §4.1). Parse walks them in order and returns the first one
+// whose auth-scheme is "Bearer" (case-insensitive per RFC 7235 §2.1).
+// Non-Bearer challenges are skipped silently. If the value contains no
+// Bearer challenge — for example, `Basic realm="x"` alone — Parse returns
+// (nil, nil), not an error: absence of a Bearer challenge is a legitimate
+// response shape from a server that does not speak RFC 9470, not a parse
+// failure.
+//
+// Unknown auth-params are preserved verbatim in Challenge.Extra to retain
+// forward compatibility with future RFC 9470 amendments and vendor
+// extensions; their presence never produces an error. Within a single
+// challenge, duplicate auth-params resolve last-write-wins for both typed
+// fields and Extra entries — RFC 7235 is silent on duplicates and this
+// library takes the lenient-unmarshal posture.
+//
+// Grammar violations — malformed quoted-string, illegal characters in a
+// token, dangling escape, non-numeric or negative max_age — return a
+// *ParseError whose Position points at the byte offset where parsing
+// first went wrong.
+//
+// For the multi-header HTTP case where the response may carry several
+// WWW-Authenticate header lines (or the comma-separated value here may
+// contain several relevant Bearer challenges), use ParseHeader, which
+// returns all Bearer challenges that carry the RFC 9470
+// "insufficient_user_authentication" error code.
+//
+// See RFC 9470 §3 — https://www.rfc-editor.org/rfc/rfc9470.html#section-3.
+func Parse(headerValue string) (*Challenge, error) {
+	i := 0
+	for i < len(headerValue) {
+		// Skip leading OWS and any stray empty list elements between
+		// challenges. RFC 7230 §7 list-rule allows ",, " between
+		// elements; treat the same way at the challenge level.
+		i = skipOWS(headerValue, i)
+		if i < len(headerValue) && headerValue[i] == ',' {
+			i++
+			continue
+		}
+		if i >= len(headerValue) {
+			break
+		}
+
+		// Read the auth-scheme token (RFC 7235 §2.1
+		// auth-scheme = token).
+		schemeStart := i
+		schemeEnd := scanToken(headerValue, i)
+		if schemeEnd == schemeStart {
+			return nil, &ParseError{
+				Position: i,
+				Reason:   "expected auth-scheme token",
+			}
+		}
+		scheme := headerValue[schemeStart:schemeEnd]
+		isBearer := strings.EqualFold(scheme, "Bearer")
+
+		// RFC 7235 §2.1: between the scheme and its first auth-param
+		// the grammar requires 1*SP; in practice this library is
+		// liberal and accepts any OWS. The tokenizer expects to be
+		// pointed at the first auth-param byte, so advance past the
+		// whitespace before delegating.
+		i = skipOWS(headerValue, schemeEnd)
+
+		// parseAuthParams consumes this scheme's auth-params and
+		// stops at the boundary of the next auth-scheme (a bare
+		// token with no '=' after BWS). The returned offset is
+		// relative to the slice we hand it.
+		params, consumed, perr := parseAuthParams(headerValue[i:])
+		if perr != nil {
+			// Translate the local Position back to an absolute
+			// byte offset in the original header value so the
+			// caller's diagnostic points at the right column.
+			return nil, &ParseError{
+				Position: i + perr.Position,
+				Reason:   perr.Reason,
+			}
+		}
+
+		if isBearer {
+			ch, ferr := challengeFromParams(params, i)
+			if ferr != nil {
+				return nil, ferr
+			}
+			return ch, nil
+		}
+
+		// Not Bearer — advance past this challenge's params and
+		// continue scanning for the next auth-scheme.
+		i += consumed
+	}
+	return nil, nil
+}
+
+// challengeFromParams maps a slice of decoded auth-params onto the typed
+// Challenge fields. Unknown param names land in Extra. The base offset is
+// the absolute byte position in the original header value where the
+// params block began; it is used to translate per-param value-position
+// errors (currently only max_age numeric failures) back to absolute
+// offsets the caller can locate.
+//
+// Within the params slice, the parser preserves source order; duplicate
+// names resolve last-write-wins for both typed fields and Extra entries.
+// This is the lenient-unmarshal posture — RFC 7235 is silent on
+// duplicates within a single challenge, so the library accepts them and
+// keeps the last value rather than erroring.
+func challengeFromParams(params []authParam, base int) (*Challenge, *ParseError) {
+	ch := &Challenge{}
+
+	// valuePos walks alongside params so we can position max_age
+	// errors at the value byte, not the start of the header. The
+	// tokenizer does not expose per-param offsets — recomputing here
+	// from name+value+separators would be brittle — so the position
+	// falls back to the params-block base when we cannot pinpoint
+	// further. The trade-off is acceptable: max_age parse failures
+	// are the only post-tokenizer error path, and pointing at the
+	// first byte of the params block still localizes the problem to
+	// the right challenge.
+	for _, p := range params {
+		switch p.name {
+		case ParamRealm:
+			ch.Realm = p.value
+		case ParamScope:
+			ch.Scope = p.value
+		case ParamError:
+			ch.ErrorCode = p.value
+		case ParamErrorDescription:
+			ch.ErrorDescription = p.value
+		case ParamErrorURI:
+			ch.ErrorURI = p.value
+		case ParamACRValues:
+			// RFC 9470 §3 mirrors OIDC §3.1.2.1's acr_values:
+			// one quoted-string of space-separated tokens.
+			// strings.Fields collapses runs of SP/HTAB and
+			// trims leading/trailing whitespace — matching the
+			// OIDC tokenization. An explicitly empty value
+			// (acr_values="") yields a non-nil zero-length
+			// slice, distinguishing "param sent, empty" from
+			// "param absent" (nil).
+			ch.ACRValues = splitACRValues(p.value)
+		case ParamMaxAge:
+			n, err := strconv.ParseUint(p.value, 10, 64)
+			if err != nil {
+				// strconv.ParseUint wraps every failure in a
+				// *strconv.NumError whose Error() string
+				// duplicates the function-and-value prefix
+				// the caller can already see in the source.
+				// Extract just the inner cause so the Reason
+				// reads cleanly when concatenated with the
+				// ParseError formatter ("invalid max_age:
+				// invalid syntax" rather than "invalid
+				// max_age: strconv.ParseUint: parsing
+				// \"abc\": invalid syntax"). The structured
+				// Position still localizes the failure to
+				// the right challenge.
+				inner := err
+				var numErr *strconv.NumError
+				if errors.As(err, &numErr) {
+					inner = numErr.Err
+				}
+				return nil, &ParseError{
+					Position: base,
+					Reason:   "invalid max_age: " + inner.Error(),
+				}
+			}
+			ch.MaxAge = &n
+		default:
+			if ch.Extra == nil {
+				ch.Extra = make(map[string]string)
+			}
+			ch.Extra[p.name] = p.value
+		}
+	}
+	return ch, nil
+}
+
+// splitACRValues tokenizes an acr_values wire value into the typed
+// []string surface. Uses strings.Fields so multiple inter-token spaces
+// (and stray tabs) collapse cleanly. Returns a non-nil zero-length slice
+// for an explicitly empty input, so the caller can distinguish the
+// "param sent with empty value" case from the "param absent" case
+// (nil ACRValues).
+func splitACRValues(s string) []string {
+	parts := strings.Fields(s)
+	if parts == nil {
+		return []string{}
+	}
+	return parts
+}
 
 // authParam is one parsed name=value pair from an RFC 7235 §2.1
 // auth-param list. The name is lowercased per RFC 7235 §2.2's
