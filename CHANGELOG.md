@@ -19,3 +19,11 @@ See [`README.md`](README.md) §Stability for the versioning policy.
   `ErrorInvalidToken`, `ErrorInsufficientScope`,
   `ErrorInsufficientUserAuthentication`) for direct comparison
   against the `Challenge.ErrorCode` field.
+- `Parse(headerValue string) (*Challenge, error)` — single-header-value
+  parser. Walks comma-separated challenges, returns the first Bearer
+  challenge with auth-params mapped onto the typed `Challenge` fields
+  (and unknown params preserved in `Extra`). Bearer scheme matching is
+  case-insensitive per RFC 7235 §2.1; non-Bearer challenges are skipped
+  silently and a value containing no Bearer challenge yields `(nil, nil)`.
+  Grammar violations and `max_age` validation failures return a
+  `*ParseError` whose `Position` points inside the offending challenge.

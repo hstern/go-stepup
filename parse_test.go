@@ -460,3 +460,351 @@ func TestQuotedPairRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// uint64p returns a pointer to v. Convenience for table-driven Parse
+// tests that need to assert on the *uint64 MaxAge field's contents
+// while distinguishing nil from a pointer to zero.
+func uint64p(v uint64) *uint64 { return &v }
+
+// TestParse exercises the public single-header-value parser. The
+// tokenizer's coverage lives in TestParseAuthParams; this table focuses
+// on the field-mapping layer Parse adds on top — scheme dispatch,
+// multi-challenge skipping, typed-field population, and the auth-params
+// that need special handling (acr_values split, max_age numeric parse).
+func TestParse(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   string
+		want *Challenge
+	}{
+		{
+			// RFC 9470 §3 example using acr_values to demand a
+			// stronger authentication context.
+			name: "RFC 9470 §3 example — acr_values",
+			in:   `Bearer realm="example", error="insufficient_user_authentication", error_description="Multi-factor authentication required", acr_values="myACR"`,
+			want: &Challenge{
+				Realm:            "example",
+				ErrorCode:        ErrorInsufficientUserAuthentication,
+				ErrorDescription: "Multi-factor authentication required",
+				ACRValues:        []string{"myACR"},
+			},
+		},
+		{
+			// RFC 9470 §3 example using max_age to demand a
+			// recent authentication event.
+			name: "RFC 9470 §3 example — max_age",
+			in:   `Bearer error="insufficient_user_authentication", error_description="More recent authentication required", max_age="5"`,
+			want: &Challenge{
+				ErrorCode:        ErrorInsufficientUserAuthentication,
+				ErrorDescription: "More recent authentication required",
+				MaxAge:           uint64p(5),
+			},
+		},
+		{
+			// RFC 9470 §3 example combining both signals — a
+			// resource asserting both a context-class and a
+			// freshness requirement.
+			name: "RFC 9470 §3 example — acr_values and max_age combined",
+			in:   `Bearer realm="example", error="insufficient_user_authentication", error_description="Strong, recent authentication required", acr_values="myACR", max_age="5"`,
+			want: &Challenge{
+				Realm:            "example",
+				ErrorCode:        ErrorInsufficientUserAuthentication,
+				ErrorDescription: "Strong, recent authentication required",
+				ACRValues:        []string{"myACR"},
+				MaxAge:           uint64p(5),
+			},
+		},
+		{
+			name: "case-insensitive scheme — lowercase",
+			in:   `bearer realm="x"`,
+			want: &Challenge{Realm: "x"},
+		},
+		{
+			name: "case-insensitive scheme — uppercase",
+			in:   `BEARER realm="x"`,
+			want: &Challenge{Realm: "x"},
+		},
+		{
+			name: "case-insensitive scheme — mixed",
+			in:   `BeArEr realm="x"`,
+			want: &Challenge{Realm: "x"},
+		},
+		{
+			name: "case-insensitive scheme — canonical",
+			in:   `Bearer realm="x"`,
+			want: &Challenge{Realm: "x"},
+		},
+		{
+			name: "non-Bearer alone returns nil challenge",
+			in:   `Basic realm="x"`,
+			want: nil,
+		},
+		{
+			name: "Bearer with no params yields zero-value challenge",
+			in:   `Bearer`,
+			want: &Challenge{},
+		},
+		{
+			// A response may legitimately advertise Basic and
+			// Bearer challenges side by side (RFC 7235 §4.1).
+			// Parse skips Basic and returns the Bearer one.
+			name: "multi-scheme: Bearer second wins over earlier Basic",
+			in:   `Basic realm="x", Bearer realm="y", error="insufficient_user_authentication"`,
+			want: &Challenge{
+				Realm:     "y",
+				ErrorCode: ErrorInsufficientUserAuthentication,
+			},
+		},
+		{
+			// Two Bearer challenges in one header value: the
+			// first one wins. ParseHeader's broader contract
+			// (return all relevant challenges in order) is the
+			// surface for callers that need to see both.
+			name: "multi-Bearer: first wins",
+			in:   `Bearer realm="first", Bearer realm="second"`,
+			want: &Challenge{Realm: "first"},
+		},
+		{
+			// Forward-compat for future RFC 9470 amendments
+			// and vendor extensions: unknown auth-params must
+			// round-trip through Extra without erroring.
+			name: "unknown auth-param lands in Extra",
+			in:   `Bearer realm="x", foo="bar"`,
+			want: &Challenge{
+				Realm: "x",
+				Extra: map[string]string{"foo": "bar"},
+			},
+		},
+		{
+			// All seven typed fields populated at once — locks
+			// in the full auth-param-name → Challenge-field
+			// mapping table. scope and error_uri only get
+			// individual coverage here; the other five are
+			// exercised by the RFC 9470 §3 example cases above.
+			name: "all typed fields populated",
+			in: `Bearer realm="r", scope="read write", error="invalid_token", ` +
+				`error_description="d", error_uri="https://example.test/err", ` +
+				`acr_values="a b", max_age=10`,
+			want: &Challenge{
+				Realm:            "r",
+				Scope:            "read write",
+				ErrorCode:        ErrorInvalidToken,
+				ErrorDescription: "d",
+				ErrorURI:         "https://example.test/err",
+				ACRValues:        []string{"a", "b"},
+				MaxAge:           uint64p(10),
+			},
+		},
+		{
+			// acr_values sent as an explicitly empty string:
+			// the parser yields a non-nil zero-length slice so
+			// callers can distinguish "param sent with empty
+			// value" from "param absent" (nil ACRValues). The
+			// godoc commits to this semantics.
+			name: "acr_values explicitly empty yields non-nil empty slice",
+			in:   `Bearer acr_values=""`,
+			want: &Challenge{ACRValues: []string{}},
+		},
+		{
+			// max_age accepts the bare-token form (RFC 7235
+			// "token" production). The tokenizer strips the
+			// quoting distinction by the time challengeFromParams
+			// sees the value, so both forms collapse here.
+			name: "max_age token form",
+			in:   `Bearer max_age=300`,
+			want: &Challenge{MaxAge: uint64p(300)},
+		},
+		{
+			name: "max_age quoted form",
+			in:   `Bearer max_age="300"`,
+			want: &Challenge{MaxAge: uint64p(300)},
+		},
+		{
+			// Zero is a valid max_age per RFC 9470 §3: it forces
+			// the client to re-authenticate even on a fresh
+			// session. The non-nil pointer carries the
+			// "param sent, value 0" signal that bare uint64
+			// could not distinguish from "param absent".
+			name: "max_age zero — non-nil pointer to 0",
+			in:   `Bearer max_age=0`,
+			want: &Challenge{MaxAge: uint64p(0)},
+		},
+		{
+			// acr_values on the wire is one space-separated
+			// quoted-string; the parser splits to []string so
+			// callers don't re-tokenize on every read. Multiple
+			// inter-token spaces collapse per OIDC §3.1.2.1's
+			// tokenization.
+			name: "acr_values split on space",
+			in:   `Bearer acr_values="urn:foo:bar urn:baz:qux"`,
+			want: &Challenge{
+				ACRValues: []string{"urn:foo:bar", "urn:baz:qux"},
+			},
+		},
+		{
+			name: "acr_values single token",
+			in:   `Bearer acr_values="urn:foo:bar"`,
+			want: &Challenge{
+				ACRValues: []string{"urn:foo:bar"},
+			},
+		},
+		{
+			// Duplicate auth-params within one challenge
+			// resolve last-write-wins. RFC 7235 is silent on
+			// duplicates; this is the lenient-unmarshal posture
+			// documented in Parse's godoc.
+			name: "duplicate realm — last write wins",
+			in:   `Bearer realm="first", realm="second"`,
+			want: &Challenge{Realm: "second"},
+		},
+		{
+			// Same last-write-wins rule applies to Extra
+			// entries — duplicate unknown params keep the last
+			// value rather than producing an error.
+			name: "duplicate unknown param — last write wins in Extra",
+			in:   `Bearer foo="first", foo="second"`,
+			want: &Challenge{
+				Extra: map[string]string{"foo": "second"},
+			},
+		},
+		{
+			// Empty header value: no scheme to dispatch on,
+			// nothing to return. Treat as "no Bearer challenge
+			// present" — same shape as a non-Bearer-only
+			// response.
+			name: "empty header value",
+			in:   ``,
+			want: nil,
+		},
+		{
+			// Whitespace-only and stray-comma input: the
+			// list-element skipping in the outer loop walks
+			// past it and returns no challenge.
+			name: "whitespace and stray commas only",
+			in:   `  , , ,  `,
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := Parse(tc.in)
+			if err != nil {
+				t.Fatalf("Parse(%q) returned error: %v", tc.in, err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("Parse(%q)\n got:  %#v\n want: %#v", tc.in, got, tc.want)
+				if got != nil && got.MaxAge != nil {
+					t.Logf("got.MaxAge = %d", *got.MaxAge)
+				}
+				if tc.want != nil && tc.want.MaxAge != nil {
+					t.Logf("want.MaxAge = %d", *tc.want.MaxAge)
+				}
+			}
+		})
+	}
+}
+
+// TestParseErrors covers the failure modes Parse surfaces: scheme
+// position, max_age numeric validation, and grammar errors that bubble
+// through from the tokenizer. The tokenizer's own error coverage lives
+// in TestParseAuthParamsErrors; this table focuses on the additional
+// error paths Parse adds on top.
+func TestParseErrors(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{
+			name: "max_age negative",
+			in:   `Bearer max_age=-1`,
+		},
+		{
+			name: "max_age non-numeric",
+			in:   `Bearer max_age="abc"`,
+		},
+		{
+			name: "max_age empty",
+			in:   `Bearer max_age=""`,
+		},
+		{
+			// Grammar violation in a Bearer challenge's
+			// params: the tokenizer's *ParseError should
+			// reach the caller verbatim (with the position
+			// translated to an absolute offset).
+			name: "unterminated quoted-string in Bearer",
+			in:   `Bearer realm="unterminated`,
+		},
+		{
+			// Grammar violation in a non-Bearer challenge's
+			// params still surfaces — the parser does not
+			// short-circuit error reporting on schemes it
+			// would otherwise skip, since a malformed value
+			// makes the subsequent challenge boundary
+			// undecidable.
+			name: "unterminated quoted-string in non-Bearer",
+			in:   `Basic realm="unterminated`,
+		},
+		{
+			// Bare bytes that are not a tchar at the scheme
+			// position: the outer loop expects an auth-scheme
+			// token first.
+			name: "non-token scheme byte",
+			in:   `@bad realm="x"`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := Parse(tc.in)
+			if err == nil {
+				t.Fatalf("Parse(%q) = (%#v, nil), want *ParseError", tc.in, got)
+			}
+			var perr *ParseError
+			if !errors.As(err, &perr) {
+				t.Fatalf("Parse(%q) returned %T, want *ParseError: %v", tc.in, err, err)
+			}
+			if got != nil {
+				t.Errorf("Parse(%q) returned non-nil challenge alongside error: %#v", tc.in, got)
+			}
+		})
+	}
+}
+
+// TestParseMaxAgeErrorPosition asserts that a max_age numeric
+// validation error carries a Position inside the failing challenge —
+// not at byte 0 of the header value, which would be misleading when the
+// failing challenge is not the first one. The exact byte is the start
+// of the failing challenge's params block; that is precise enough to
+// localize the problem without forcing the implementation to thread a
+// per-param offset through the tokenizer.
+func TestParseMaxAgeErrorPosition(t *testing.T) {
+	t.Parallel()
+
+	// First challenge is Basic and is skipped; Bearer is the second
+	// challenge and contains the bad max_age. The error position
+	// should fall inside the Bearer challenge's params region (after
+	// the "Basic realm=\"x\", Bearer " prefix), not at byte 0.
+	in := `Basic realm="x", Bearer max_age="not a number"`
+	_, err := Parse(in)
+	if err == nil {
+		t.Fatalf("Parse(%q) returned nil error, want *ParseError", in)
+	}
+	var perr *ParseError
+	if !errors.As(err, &perr) {
+		t.Fatalf("Parse(%q) returned %T, want *ParseError: %v", in, err, err)
+	}
+	bearerAt := strings.Index(in, "max_age")
+	if perr.Position < bearerAt {
+		t.Errorf("Parse(%q) reported position %d, want >= %d (inside the Bearer challenge)",
+			in, perr.Position, bearerAt)
+	}
+}
