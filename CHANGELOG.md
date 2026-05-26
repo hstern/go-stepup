@@ -22,6 +22,19 @@ See [`README.md`](README.md) §Stability for the versioning policy.
   without hardcoding strings. Does not inspect `Realm`, `Scope`,
   `ErrorDescription`, `ErrorURI`, or `Extra` — the latter is the
   forward-compatibility hatch and remains untouched by design.
+- Spec-fixture corpus: every WWW-Authenticate example from RFC 9470 §3
+  is embedded under `internal/specfixtures/` as one `.txt` file per
+  figure, and a root-package `conformance_test.go` iterates the corpus
+  asserting the `Parse → String → Parse` round-trip yields
+  typed-field-equivalent `*Challenge` values (not byte-equivalent — the
+  canonical formatter may reorder, lowercase, or re-quote). A companion
+  `MarshalString`-vs-`String` agreement test pins the fail-fast
+  formatter's output to match `String` byte-for-byte on every spec
+  example, since none of them contain bytes the quoted-string grammar
+  cannot represent. Adding a new fixture is "drop a `.txt` file"; the
+  `//go:embed` directive picks it up on the next build with no Go
+  change required. The corpus is intentionally `internal/` — it is a
+  library-private testing aid, not part of the public API.
 - Auth-param name constants (`ParamRealm`, `ParamScope`, `ParamError`,
   `ParamErrorDescription`, `ParamErrorURI`, `ParamACRValues`,
   `ParamMaxAge`) covering the RFC 7235 / RFC 6750 / RFC 9470 §3

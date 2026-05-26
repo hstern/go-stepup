@@ -1,0 +1,1 @@
+Bearer error="insufficient_user_authentication", error_description="A different authentication level is required", acr_values="myACR"
