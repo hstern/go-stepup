@@ -39,6 +39,19 @@ See [`README.md`](README.md) §Stability for the versioning policy.
   `(nil, nil)`. On the first grammar violation in any header value the
   call aborts and returns `(nil, *ParseError)` rather than yielding a
   partial result.
+- `(*Challenge).MarshalString() (string, error)` — fail-fast sibling of
+  `String`. Returns the same canonical bytes when every value is
+  representable by RFC 7230 §3.2.6 quoted-string + quoted-pair; returns
+  a `*FormatError` naming the field and the offending byte's offset when
+  a value contains a byte that grammar cannot encode (any control byte
+  other than HTAB, plus DEL — including CR and LF, the header-framing
+  injection vectors). Use when the lossy SP-substitution `String` does
+  is the wrong behavior — fixture serialization, interop regression
+  tests, security-sensitive callers that need to surface malformed input
+  rather than mask it. On multiple offending fields the first failure
+  in spec emit order wins (so a Realm CR plus a Scope LF reports the
+  realm); a pure-empty `Challenge` marshals to `"Bearer"` with no
+  error, matching the canonical-form rule `String` pins.
 - `(*Challenge).String() string` — canonical-form `WWW-Authenticate`
   formatter satisfying [`fmt.Stringer`]. Emits the literal `Bearer`
   scheme, the seven RFC 9470 / RFC 6750 / RFC 7235 auth-params in spec
