@@ -5,6 +5,7 @@ package stepup
 
 import (
 	"errors"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -519,4 +520,179 @@ func TestChallengeStringRoundTripExtra(t *testing.T) {
 		t.Fatalf("Extra round-trip lost data\n first:  %+v\n second: %+v\n formatted: %q",
 			first, second, formatted)
 	}
+}
+
+// TestWriteHeader covers the http.Header convenience: every call appends a
+// new WWW-Authenticate value, the value equals what String would have
+// produced for the same Challenge, and coexistence with values already on
+// the header (e.g. a Basic fallback challenge written via direct h.Add) is
+// preserved in source order. The systematic round-trip via ParseHeader
+// lives in TestWriteHeaderRoundTrip below; the nil-receiver behavior in
+// TestWriteHeaderNilPanics.
+func TestWriteHeader(t *testing.T) {
+	t.Parallel()
+
+	t.Run("single call appends one value equal to String", func(t *testing.T) {
+		t.Parallel()
+		c := &Challenge{
+			Realm:     "example",
+			ErrorCode: ErrorInsufficientUserAuthentication,
+		}
+		h := http.Header{}
+		c.WriteHeader(h)
+		got := h.Values("WWW-Authenticate")
+		want := []string{c.String()}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("WWW-Authenticate values\n got: %q\nwant: %q", got, want)
+		}
+	})
+
+	t.Run("multi-call appends in call order", func(t *testing.T) {
+		t.Parallel()
+		// Three distinct challenges; verifying that successive
+		// WriteHeader calls append (rather than overwrite) and that
+		// the observed order matches the call order.
+		challenges := []*Challenge{
+			{Realm: "first", ErrorCode: ErrorInsufficientUserAuthentication},
+			{Realm: "second", ErrorCode: ErrorInsufficientUserAuthentication, MaxAge: uintPtr(60)},
+			{Realm: "third", ErrorCode: ErrorInsufficientUserAuthentication, ACRValues: []string{"urn:a", "urn:b"}},
+		}
+		h := http.Header{}
+		for _, c := range challenges {
+			c.WriteHeader(h)
+		}
+		got := h.Values("WWW-Authenticate")
+		if len(got) != len(challenges) {
+			t.Fatalf("got %d header values, want %d: %q", len(got), len(challenges), got)
+		}
+		for i, c := range challenges {
+			if got[i] != c.String() {
+				t.Errorf("value[%d]\n got: %q\nwant: %q", i, got[i], c.String())
+			}
+		}
+	})
+
+	t.Run("coexists with prior h.Add", func(t *testing.T) {
+		t.Parallel()
+		// A 401 response advertising a Basic fallback alongside the
+		// Bearer step-up challenge: the Basic value was written by
+		// the caller before WriteHeader; WriteHeader must append, not
+		// replace, so the two end up in source order.
+		const basic = `Basic realm="legacy"`
+		h := http.Header{}
+		h.Add("WWW-Authenticate", basic)
+		c := &Challenge{
+			Realm:     "example",
+			ErrorCode: ErrorInsufficientUserAuthentication,
+			ACRValues: []string{"urn:mace:incommon:iap:silver"},
+		}
+		c.WriteHeader(h)
+		got := h.Values("WWW-Authenticate")
+		want := []string{basic, c.String()}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("coexistence ordering wrong\n got: %q\nwant: %q", got, want)
+		}
+	})
+
+	t.Run("empty Challenge writes bare scheme", func(t *testing.T) {
+		t.Parallel()
+		// Mirrors TestChallengeString "empty challenge emits scheme
+		// only" — the canonical-form rule means the value is "Bearer"
+		// with no parameters, which WriteHeader writes verbatim.
+		c := &Challenge{}
+		h := http.Header{}
+		c.WriteHeader(h)
+		got := h.Values("WWW-Authenticate")
+		want := []string{"Bearer"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("empty Challenge value\n got: %q\nwant: %q", got, want)
+		}
+	})
+}
+
+// TestWriteHeaderRoundTrip is the phase-4 acceptance signal across the
+// full marshal/unmarshal seam: build a Challenge with every RFC 9470
+// field set, emit it via WriteHeader, parse the resulting http.Header
+// back via ParseHeader, and assert typed-field equivalence with the
+// original. The challenge MUST carry
+// error="insufficient_user_authentication" so it survives ParseHeader's
+// step-up filter — pinning the asymmetry that WriteHeader emits any
+// Bearer Challenge faithfully while ParseHeader returns only step-up
+// ones (see TestWriteHeaderNonStepUpFilteredByParseHeader for the other
+// half of the asymmetry).
+func TestWriteHeaderRoundTrip(t *testing.T) {
+	t.Parallel()
+	original := &Challenge{
+		Realm:            "example",
+		Scope:            "openid profile",
+		ErrorCode:        ErrorInsufficientUserAuthentication,
+		ErrorDescription: "Strong authentication required",
+		ErrorURI:         "https://example.com/err",
+		ACRValues:        []string{"urn:mace:incommon:iap:silver"},
+		MaxAge:           uintPtr(300),
+		Extra: map[string]string{
+			"vendor_token": "abc",
+			"trace_id":     "xyz",
+		},
+	}
+	h := http.Header{}
+	original.WriteHeader(h)
+	got, err := ParseHeader(h)
+	if err != nil {
+		t.Fatalf("ParseHeader after WriteHeader: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ParseHeader returned %d challenges, want 1: %+v", len(got), got)
+	}
+	if !reflect.DeepEqual(got[0], original) {
+		t.Fatalf("round-trip lost data\n original: %+v\n parsed:   %+v\n wire:     %q",
+			original, got[0], h.Values("WWW-Authenticate"))
+	}
+}
+
+// TestWriteHeaderNonStepUpFilteredByParseHeader pins the other half of
+// the asymmetry exercised in TestWriteHeaderRoundTrip: WriteHeader
+// faithfully emits a Bearer challenge carrying error="invalid_token";
+// ParseHeader, scoped to RFC 9470 step-up challenges only, returns nil.
+// Locks in the design rule that emission is policy-free — gating which
+// Challenges are appropriate to write is the caller's job, not
+// WriteHeader's.
+func TestWriteHeaderNonStepUpFilteredByParseHeader(t *testing.T) {
+	t.Parallel()
+	c := &Challenge{
+		Realm:     "example",
+		ErrorCode: ErrorInvalidToken, // not the step-up code
+	}
+	h := http.Header{}
+	c.WriteHeader(h)
+	// The wire value really does carry the non-step-up challenge —
+	// that's the WriteHeader half of the contract.
+	if got := h.Values("WWW-Authenticate"); len(got) != 1 || !strings.Contains(got[0], ErrorInvalidToken) {
+		t.Fatalf("WriteHeader did not faithfully emit invalid_token: %q", got)
+	}
+	// ParseHeader, by design, filters it out.
+	parsed, err := ParseHeader(h)
+	if err != nil {
+		t.Fatalf("ParseHeader unexpected error: %v", err)
+	}
+	if parsed != nil {
+		t.Fatalf("ParseHeader returned %+v; want nil (step-up filter should drop invalid_token)", parsed)
+	}
+}
+
+// TestWriteHeaderNilPanics pins the documented behavior on a nil
+// receiver: WriteHeader does not defensively guard the nil http.Header
+// argument; it lets http.Header.Add panic. The match with the stdlib
+// matters because masking the panic would only push the same
+// programming error one stack frame deeper and surprise a caller who
+// expected the standard stdlib failure mode.
+func TestWriteHeaderNilPanics(t *testing.T) {
+	t.Parallel()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("WriteHeader on nil http.Header did not panic; want stdlib http.Header.Add panic")
+		}
+	}()
+	c := &Challenge{Realm: "example"}
+	c.WriteHeader(nil)
 }

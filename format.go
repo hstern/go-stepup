@@ -5,6 +5,7 @@ package stepup
 
 import (
 	"fmt"
+	"net/http"
 	"slices"
 	"strconv"
 	"strings"
@@ -208,6 +209,46 @@ func (c *Challenge) MarshalString() (string, error) {
 	// representable, so writeQuotedString's substitution branch is
 	// dead and the output is byte-identical to String.
 	return c.String(), nil
+}
+
+// WriteHeader appends a canonical WWW-Authenticate value for c to h. It
+// is a thin convenience over c.String and [http.Header.Add] — the
+// equivalent of:
+//
+//	h.Add("WWW-Authenticate", c.String())
+//
+// Multiple calls append additional challenges as additional header
+// values: a 401 response advertising both a Bearer step-up challenge
+// and a fallback Basic challenge is two WriteHeader calls (or one
+// WriteHeader plus one direct h.Add). Servers wanting multiple Bearer
+// challenges packed into ONE header value should format them manually —
+// this helper writes one value per call, which is the
+// stdlib-idiomatic shape and the form parsers must handle anyway per
+// RFC 7235 §4.1.
+//
+// WriteHeader inherits String's lossy fallback for bytes the wire
+// cannot represent (raw control characters, CR, LF — each replaced
+// with SP). Callers who need fail-fast on malformed input should use
+// [Challenge.MarshalString] and call h.Add on the returned string
+// themselves, branching on the returned *FormatError. The two
+// together cover both ergonomic shapes: "I trust my Challenge"
+// (WriteHeader) versus "I'm serializing untrusted input"
+// (MarshalString + h.Add + error check).
+//
+// WriteHeader is faithful to whatever Challenge it receives — it does
+// not gate on the error code. A Bearer challenge advertising
+// error="invalid_token" round-trips through WriteHeader exactly like
+// a step-up challenge does, even though [ParseHeader] would filter
+// the non-step-up form back out on the receive side. The library
+// treats emission as policy-free; deciding whether a given Challenge
+// is appropriate to emit is the caller's job.
+//
+// h must not be nil. Passing a nil [http.Header] panics, matching the
+// behavior of [http.Header.Add] on a nil receiver — no extra
+// defensive check here, because masking the stdlib panic would only
+// hide a programming error one stack frame deeper.
+func (c *Challenge) WriteHeader(h http.Header) {
+	h.Add("WWW-Authenticate", c.String())
 }
 
 // validateForWire walks c in canonical emit order and returns the first
