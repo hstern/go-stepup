@@ -39,3 +39,16 @@ See [`README.md`](README.md) §Stability for the versioning policy.
   `(nil, nil)`. On the first grammar violation in any header value the
   call aborts and returns `(nil, *ParseError)` rather than yielding a
   partial result.
+- `(*Challenge).String() string` — canonical-form `WWW-Authenticate`
+  formatter satisfying [`fmt.Stringer`]. Emits the literal `Bearer`
+  scheme, the seven RFC 9470 / RFC 6750 / RFC 7235 auth-params in spec
+  order (`realm`, `scope`, `error`, `error_description`, `error_uri`,
+  `acr_values`, `max_age`) for fields that carry a non-zero value, then
+  every `Extra` entry in lexicographic key order — so the output is
+  byte-stable across runs even though Go map iteration is randomized.
+  Text parameters are always quoted-string per RFC 7230 §3.2.6; `max_age`
+  is always token form. Per the [`fmt.Stringer`] no-error contract,
+  bytes the quoted-string production cannot represent (raw control
+  characters, CR, LF) are best-effort replaced with `SP`; the
+  replacement incidentally neutralizes CRLF header-injection vectors by
+  collapsing them to in-quote whitespace.
