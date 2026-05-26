@@ -9,6 +9,16 @@ See [`README.md`](README.md) §Stability for the versioning policy.
 
 ## [Unreleased]
 
+### Changed
+
+- Rewrote the README quickstart against the landed `ParseHeader` /
+  `WriteHeader` surface: replaced the stale bootstrap client snippet
+  (which referenced a non-existent `c.Err()` method) with a compilable
+  end-to-end parse example, added a resource-server emission example,
+  documented the `ErrInsufficientUserAuthentication` sentinel's
+  intended `errors.Is` wrap-and-dispatch role, and extended the
+  Stability section to cover `Validate`'s rule-identifier contract.
+
 ### Added
 
 - `(*Challenge).Validate() error` — opt-in semantic validator over the

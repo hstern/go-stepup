@@ -21,7 +21,10 @@ typed parse / format helpers a client needs to interpret it.
   error code.
 - A strict canonical-form formatter — `(*Challenge).String()` and
   `(*Challenge).WriteHeader(http.Header)` — that emits a single,
-  byte-stable representation suitable for interop testing.
+  byte-stable representation suitable for interop testing, plus a
+  fail-fast `(*Challenge).MarshalString() (string, error)` variant
+  for callers that want to surface unrepresentable bytes instead of
+  having them substituted.
 - An optional `(*Challenge).Validate() error` for callers that want
   semantic checking on top of the spec's grammar requirements.
 - A sentinel `ErrInsufficientUserAuthentication` for the dispatch
@@ -41,11 +44,18 @@ tracks RFC 9470 (Proposed Standard, 2023-09), exposed as
 
 ### Client — parse a step-up challenge from a 401 response
 
+`ParseHeader` walks every `WWW-Authenticate` value on the response,
+filters to Bearer challenges carrying
+`error="insufficient_user_authentication"`, and returns them in header
+order. Non-Bearer schemes (Basic, Digest) and Bearer challenges with
+any other error code are silently skipped — so every `*Challenge` in
+the returned slice is, by construction, a step-up challenge the
+client must act on.
+
 ```go
 package main
 
 import (
-	"errors"
 	"log"
 	"net/http"
 
@@ -55,19 +65,29 @@ import (
 func handle(resp *http.Response) {
 	challenges, err := stepup.ParseHeader(resp.Header)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err) // malformed WWW-Authenticate header
 	}
 	for _, c := range challenges {
-		if errors.Is(c.Err(), stepup.ErrInsufficientUserAuthentication) {
-			log.Printf("step-up required: acr_values=%v max_age=%v",
-				c.ACRValues, c.MaxAge)
-			// trigger re-authentication with the requested ACR / max_age
-		}
+		log.Printf("step-up required: acr_values=%v max_age=%v",
+			c.ACRValues, c.MaxAge)
+		// Trigger re-authentication at the requested ACR / max_age.
 	}
 }
 ```
 
+The `ErrInsufficientUserAuthentication` sentinel is exported for
+consumers that wrap a parsed step-up challenge into Go's error-chain
+idiom (`fmt.Errorf("step-up required: %w", stepup.ErrInsufficientUserAuthentication)`)
+so upstream callers can dispatch via `errors.Is`. The library itself
+never returns it — `ParseHeader` returns `(nil, *ParseError)` on
+grammar violations and `(challenges, nil)` otherwise.
+
 ### Resource server — emit a step-up challenge
+
+`WriteHeader` appends a canonical-form value to an `http.Header`.
+Multiple calls append additional challenges, so a response advertising
+a Bearer step-up challenge alongside a Basic fallback is two calls (or
+one `WriteHeader` plus one direct `Header.Add`).
 
 ```go
 package main
@@ -113,6 +133,13 @@ surface may evolve until the first major. Once `v1.0.0` ships:
   guaranteed to produce typed-field-equivalent `Challenge` values.
 - New optional `Challenge` fields may be added as future RFC 9470
   amendments emerge; existing fields are not removed or renamed.
+- The optional `(*Challenge).Validate()` semantic check follows the
+  same contract: new rules may be added between minor versions and
+  may newly reject input that previously passed, but the reverse
+  (relaxing a rule so previously-rejected input passes) is a major
+  bump. Existing rule identifiers (`RuleErrorCodeRecognized`,
+  `RuleACRValuesNonEmpty`, `RuleMaxAgeInBounds`) are stable; new
+  rules add new `Rule*` constants.
 
 The library SemVer is independent of the RFC version it implements.
 
