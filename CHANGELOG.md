@@ -39,6 +39,18 @@ See [`README.md`](README.md) §Stability for the versioning policy.
   `(nil, nil)`. On the first grammar violation in any header value the
   call aborts and returns `(nil, *ParseError)` rather than yielding a
   partial result.
+- `(*Challenge).WriteHeader(h http.Header)` — convenience sugar that
+  appends a canonical-form `WWW-Authenticate` value (the result of
+  `c.String`) to `h`. Multiple calls append additional header values, so
+  a response advertising a Bearer step-up challenge alongside a Basic
+  fallback is two `WriteHeader` calls (or one `WriteHeader` plus one
+  direct `h.Add`). Inherits `String`'s lossy SP-substitution fallback
+  for unrepresentable bytes; callers who need fail-fast behavior should
+  call `MarshalString` and add the result themselves. Emission is
+  policy-free — `WriteHeader` faithfully writes any Bearer `Challenge`,
+  even one whose `ErrorCode` would be filtered out on the receive side
+  by `ParseHeader`. Passing a nil `http.Header` panics, matching the
+  behavior of `http.Header.Add` on a nil receiver.
 - `(*Challenge).MarshalString() (string, error)` — fail-fast sibling of
   `String`. Returns the same canonical bytes when every value is
   representable by RFC 7230 §3.2.6 quoted-string + quoted-pair; returns
