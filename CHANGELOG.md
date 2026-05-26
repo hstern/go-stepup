@@ -27,3 +27,15 @@ See [`README.md`](README.md) §Stability for the versioning policy.
   silently and a value containing no Bearer challenge yields `(nil, nil)`.
   Grammar violations and `max_age` validation failures return a
   `*ParseError` whose `Position` points inside the offending challenge.
+- `ParseHeader(h http.Header) ([]*Challenge, error)` — HTTP-level
+  dispatch entry point. Scans every `WWW-Authenticate` header value
+  (case-insensitive header-name lookup via `http.Header.Values`), and
+  returns the Bearer challenges that carry
+  `error="insufficient_user_authentication"` — i.e. the RFC 9470 step-up
+  challenges — in header-then-source order. Non-Bearer schemes and
+  Bearer challenges with any other (or absent) error code are silently
+  filtered out, so a response advertising Basic and Bearer challenges in
+  parallel, or a Bearer challenge signalling `invalid_token`, surfaces as
+  `(nil, nil)`. On the first grammar violation in any header value the
+  call aborts and returns `(nil, *ParseError)` rather than yielding a
+  partial result.

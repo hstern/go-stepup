@@ -5,6 +5,7 @@ package stepup
 
 import (
 	"errors"
+	"net/http"
 	"strconv"
 	"strings"
 )
@@ -20,6 +21,16 @@ import (
 // response shape from a server that does not speak RFC 9470, not a parse
 // failure.
 //
+// Parse does NOT filter on the [ErrorInsufficientUserAuthentication]
+// error code; the first Bearer challenge is returned regardless of its
+// ErrorCode (or absence thereof). This is the right entry point for a
+// client that already knows the response is a step-up challenge and
+// wants the parsed view of it. For HTTP dispatch — "is this an RFC 9470
+// step-up response at all, and if so what does it ask for?" — use
+// [ParseHeader], which scans every WWW-Authenticate header line and
+// filters to Bearer challenges that carry
+// error="insufficient_user_authentication".
+//
 // Unknown auth-params are preserved verbatim in Challenge.Extra to retain
 // forward compatibility with future RFC 9470 amendments and vendor
 // extensions; their presence never produces an error. Within a single
@@ -32,14 +43,87 @@ import (
 // *ParseError whose Position points at the byte offset where parsing
 // first went wrong.
 //
-// For the multi-header HTTP case where the response may carry several
-// WWW-Authenticate header lines (or the comma-separated value here may
-// contain several relevant Bearer challenges), use ParseHeader, which
-// returns all Bearer challenges that carry the RFC 9470
-// "insufficient_user_authentication" error code.
-//
 // See RFC 9470 §3 — https://www.rfc-editor.org/rfc/rfc9470.html#section-3.
 func Parse(headerValue string) (*Challenge, error) {
+	chs, err := scanBearerChallenges(headerValue)
+	if err != nil {
+		return nil, err
+	}
+	if len(chs) == 0 {
+		return nil, nil
+	}
+	return chs[0], nil
+}
+
+// ParseHeader scans every WWW-Authenticate header in h and returns the
+// Bearer challenges that carry error="insufficient_user_authentication"
+// — i.e. RFC 9470 step-up challenges — in header-then-source order.
+//
+// The filter is the entire point of this entry: a response may
+// legitimately advertise Basic and Bearer challenges in parallel (RFC
+// 7235 §4.1), and a Bearer challenge may itself signal any RFC 6750
+// error (invalid_request / invalid_token / insufficient_scope) or no
+// error at all. ParseHeader is concerned only with RFC 9470 challenges,
+// so non-Bearer schemes are silently skipped and Bearer challenges
+// whose ErrorCode is anything other than
+// [ErrorInsufficientUserAuthentication] are dropped from the result.
+// Callers who want the broader "first Bearer challenge regardless of
+// error code" view on a single header value should use [Parse].
+//
+// Header name matching follows http.Header.Values, which canonicalizes
+// "www-authenticate", "WWW-Authenticate", etc. to the single MIME
+// canonical form. Multiple header lines are walked in their stored
+// order, and challenges within one header value are walked in source
+// order; the two iterations compose to "header-then-source" ordering
+// in the returned slice.
+//
+// When no WWW-Authenticate header is present, or none of the present
+// challenges pass the filter, ParseHeader returns (nil, nil). An empty
+// http.Header and an http.Header with no matching challenges are
+// indistinguishable in the return: both signal "no RFC 9470 step-up
+// challenge here," which is what the caller cares about.
+//
+// On the first grammar violation in any header value, ParseHeader
+// returns (nil, err) without processing subsequent headers. The
+// alternative — "collect errors and return what parsed" — would lose
+// data the caller might need to see; a malformed header-set is a
+// malformed header-set, and the consumer should know.
+//
+// See RFC 9470 §3 — https://www.rfc-editor.org/rfc/rfc9470.html#section-3.
+func ParseHeader(h http.Header) ([]*Challenge, error) {
+	var out []*Challenge
+	for _, v := range h.Values("WWW-Authenticate") {
+		chs, err := scanBearerChallenges(v)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range chs {
+			if c.ErrorCode == ErrorInsufficientUserAuthentication {
+				out = append(out, c)
+			}
+		}
+	}
+	return out, nil
+}
+
+// scanBearerChallenges walks one WWW-Authenticate header value and
+// returns every Bearer challenge in source order. Non-Bearer schemes
+// (Basic, Digest, and any future scheme) are silently skipped. The
+// returned challenges have not been filtered on ErrorCode — that is the
+// caller's responsibility; ParseHeader applies the RFC 9470
+// "insufficient_user_authentication" filter, while Parse does not.
+//
+// The function is the shared backbone of Parse (which takes the first
+// returned challenge) and ParseHeader (which fans out across header
+// lines and applies the error-code filter). Both surfaces share the
+// scheme-skipping and grammar-error-propagation behavior; only the
+// per-value selection differs.
+//
+// Grammar violations bubble up unchanged: the returned *ParseError
+// carries an absolute byte offset within the value the caller passed
+// in. The first error short-circuits the scan.
+func scanBearerChallenges(headerValue string) ([]*Challenge, error) {
+	var out []*Challenge
 	i := 0
 	for i < len(headerValue) {
 		// Skip leading OWS and any stray empty list elements between
@@ -94,14 +178,18 @@ func Parse(headerValue string) (*Challenge, error) {
 			if ferr != nil {
 				return nil, ferr
 			}
-			return ch, nil
+			out = append(out, ch)
 		}
 
-		// Not Bearer — advance past this challenge's params and
-		// continue scanning for the next auth-scheme.
+		// Advance past this challenge's params and continue scanning
+		// for the next auth-scheme. parseAuthParams' returned consumed
+		// is 0 when it surrendered a bare token (the next scheme) at
+		// the very start of its input — in that case the outer loop
+		// re-reads the same byte as a fresh scheme on the next
+		// iteration, which is what we want.
 		i += consumed
 	}
-	return nil, nil
+	return out, nil
 }
 
 // challengeFromParams maps a slice of decoded auth-params onto the typed
