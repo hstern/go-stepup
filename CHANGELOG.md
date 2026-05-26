@@ -77,3 +77,13 @@ See [`README.md`](README.md) §Stability for the versioning policy.
   characters, CR, LF) are best-effort replaced with `SP`; the
   replacement incidentally neutralizes CRLF header-injection vectors by
   collapsing them to in-quote whitespace.
+- Forward-compatibility regression tests (`forward_compat_test.go`)
+  pinning the contract that auth-params the parser does not recognize
+  as one of the seven RFC 9470 / RFC 6750 / RFC 7235 spec-defined names
+  land verbatim on `Challenge.Extra`, that the canonical-form formatter
+  emits them back, and that `Parse → String → Parse` and the HTTP-level
+  `WriteHeader → ParseHeader` round-trips preserve them. This is the
+  invariant that lets existing consumers survive a future RFC 9470
+  amendment that adds a new auth-param, or a vendor extension a
+  particular resource server chooses to advertise, without a library
+  upgrade.
