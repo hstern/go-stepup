@@ -1,0 +1,1 @@
+Bearer error="insufficient_user_authentication", error_description="More recent authentication is required", max_age="5"
