@@ -11,6 +11,17 @@ See [`README.md`](README.md) §Stability for the versioning policy.
 
 ### Added
 
+- `(*Challenge).Validate() error` — opt-in semantic validator over the
+  grammar-correct types `Parse` produces. Rejects an unrecognized `error`
+  code, an empty `acr_values` token, or a `max_age` above the package-level
+  `MaxAgeUpperBound` (default one year of seconds; overridable before
+  calling `Validate`). Returns the first `*ValidationError` it finds in
+  field declaration order; the stable rule identifiers
+  `RuleErrorCodeRecognized`, `RuleACRValuesNonEmpty`, and
+  `RuleMaxAgeInBounds` are exported so `errors.As` consumers can branch
+  without hardcoding strings. Does not inspect `Realm`, `Scope`,
+  `ErrorDescription`, `ErrorURI`, or `Extra` — the latter is the
+  forward-compatibility hatch and remains untouched by design.
 - Auth-param name constants (`ParamRealm`, `ParamScope`, `ParamError`,
   `ParamErrorDescription`, `ParamErrorURI`, `ParamACRValues`,
   `ParamMaxAge`) covering the RFC 7235 / RFC 6750 / RFC 9470 §3
