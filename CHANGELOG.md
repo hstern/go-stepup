@@ -9,6 +9,18 @@ See [`README.md`](README.md) §Stability for the versioning policy.
 
 ## [Unreleased]
 
+### Added
+
+- Godoc Example functions (`example_test.go`) for every public entry
+  point — `ExampleParse`, `ExampleParseHeader`, `ExampleChallenge_String`,
+  `ExampleChallenge_WriteHeader`, `ExampleChallenge_MarshalString`,
+  `ExampleChallenge_Validate`. These are executable documentation:
+  `go test` runs them and compares stdout against the `// Output:` block,
+  so the snippets pkg.go.dev renders cannot drift from the actual API
+  behavior. `ExampleParseHeader` doubles as documentation for the
+  Bearer-plus-`insufficient_user_authentication` filter — the most
+  surprising behavior on the parse side.
+
 ### Changed
 
 - Rewrote the README quickstart against the landed `ParseHeader` /
@@ -18,8 +30,14 @@ See [`README.md`](README.md) §Stability for the versioning policy.
   documented the `ErrInsufficientUserAuthentication` sentinel's
   intended `errors.Is` wrap-and-dispatch role, and extended the
   Stability section to cover `Validate`'s rule-identifier contract.
-
-### Added
+- Doc-comment polish across the public API. Cross-references now use Go
+  1.19+ `[Symbol]` bracket links so they render as hyperlinks on
+  pkg.go.dev; the package overview lists every entry point and pins the
+  Parse → String → Parse typed-field-equivalence round-trip contract;
+  `FormatError.Field` and `ValidationError.Field` now document that they
+  carry the wire auth-param name (matching the `Param*` constants), not
+  the Go struct field name on `Challenge`. No behavior changes — these
+  are purely doc-comment edits.
 
 - `(*Challenge).Validate() error` — opt-in semantic validator over the
   grammar-correct types `Parse` produces. Rejects an unrecognized `error`

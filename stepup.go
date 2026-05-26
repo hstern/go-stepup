@@ -5,15 +5,33 @@
 // Authentication Challenge Protocol.
 //
 // The library parses and emits the WWW-Authenticate: Bearer challenge a
-// resource server returns when an access token is technically valid but does
-// not meet the authentication strength (or recency) the resource requires.
-// Consumers dispatch on the typed [Challenge] value or on the
-// [ErrInsufficientUserAuthentication] sentinel that subsequent commits
-// introduce.
+// resource server returns when an access token is technically valid but
+// does not meet the authentication strength (or recency) the resource
+// requires. Consumers dispatch on the typed [Challenge] value or on the
+// [ErrInsufficientUserAuthentication] sentinel.
 //
-// Subsequent commits add the Challenge type, the parser, the canonical-form
-// formatter, the optional Validate, and the spec-fixture round-trip test
-// corpus.
+// # Entry points
+//
+//   - [Parse] decodes a single WWW-Authenticate header value into a
+//     [Challenge] (returns the first Bearer challenge in the value;
+//     [Parse] is policy-free about the error code it carries).
+//   - [ParseHeader] iterates every WWW-Authenticate header on an
+//     [http.Header] and returns only the Bearer challenges carrying
+//     error="insufficient_user_authentication" — i.e. RFC 9470 step-up
+//     challenges. This is the right entry point for HTTP-level dispatch.
+//   - [Challenge.String] emits a Challenge as a canonical WWW-Authenticate
+//     value; [Challenge.WriteHeader] is sugar over [http.Header.Add].
+//   - [Challenge.MarshalString] is the fail-fast sibling of String.
+//   - [Challenge.Validate] is the opt-in semantic check.
+//
+// # Round-trip semantics
+//
+// Parse → String → Parse preserves typed-field equivalence, not byte
+// equivalence. The canonical formatter may reorder parameters into spec
+// order, lowercase auth-param names, normalize quoting (token vs
+// quoted-string for max_age), and pin the auth-scheme literal to
+// "Bearer" — RFC 7235 §2.1 makes scheme and auth-param names
+// case-insensitive on the wire, so all of these are spec-conformant.
 //
 // See https://www.rfc-editor.org/rfc/rfc9470.html.
 package stepup
@@ -113,6 +131,8 @@ const (
 	// "insufficient_user_authentication" error code defined by RFC 9470
 	// §3, signalling that the access token is valid but the
 	// authentication event behind it does not meet the resource's
-	// strength or recency requirement.
+	// strength or recency requirement. The Go-level sentinel
+	// [ErrInsufficientUserAuthentication] carries this same literal
+	// payload as an [error] value for use with [errors.Is].
 	ErrorInsufficientUserAuthentication = "insufficient_user_authentication"
 )

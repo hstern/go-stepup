@@ -8,22 +8,24 @@ import (
 	"fmt"
 )
 
-// ErrInsufficientUserAuthentication is the sentinel value clients dispatch on
-// when bridging a parsed [Challenge] into Go's error-chain idiom. The string
-// matches the RFC 9470 §3 error code "insufficient_user_authentication"
-// verbatim so a Challenge whose ErrorCode equals this value can be wrapped
-// and surfaced through errors.Is without an intermediate translation step.
+// ErrInsufficientUserAuthentication is the sentinel value clients dispatch
+// on when bridging a parsed [Challenge] into Go's error-chain idiom. Its
+// Error string matches the RFC 9470 §3 error code
+// "insufficient_user_authentication" verbatim — the same literal the wire
+// constant [ErrorInsufficientUserAuthentication] carries — so a Challenge
+// whose ErrorCode equals that value can be wrapped and surfaced through
+// [errors.Is] without an intermediate translation step.
 //
-// This is not returned by the parser itself — Parse returns a *ParseError on
-// grammar failure, never this sentinel. Consumers that treat an
-// "insufficient_user_authentication" challenge as an actionable error wrap or
-// compare against this value themselves:
+// This is not returned by the parser itself — [Parse] returns a
+// *[ParseError] on grammar failure, never this sentinel. Consumers that
+// treat an "insufficient_user_authentication" challenge as an actionable
+// error wrap or compare against this value themselves:
 //
 //	ch, err := stepup.Parse(headerValue)
 //	if err != nil {
 //	    return err
 //	}
-//	if ch != nil && ch.ErrorCode == stepup.ErrInsufficientUserAuthentication.Error() {
+//	if ch != nil && ch.ErrorCode == stepup.ErrorInsufficientUserAuthentication {
 //	    return fmt.Errorf("step-up required: %w", stepup.ErrInsufficientUserAuthentication)
 //	}
 //
@@ -31,11 +33,12 @@ import (
 var ErrInsufficientUserAuthentication = errors.New("insufficient_user_authentication")
 
 // ParseError reports a grammar-level failure while decoding a
-// WWW-Authenticate header value. Returned by Parse and ParseHeader when the
-// input violates the RFC 7235 auth-param grammar — unterminated quoted
-// string, bad quoted-pair, malformed token, and so on. Semantic problems
-// (unknown error code, out-of-range max_age) are not ParseErrors; those
-// surface from Validate as a *ValidationError.
+// WWW-Authenticate header value. Returned by [Parse] and [ParseHeader]
+// when the input violates the RFC 7235 §2 auth-param grammar —
+// unterminated quoted string, bad quoted-pair, malformed token, and so
+// on. Semantic problems (unknown error code, out-of-range max_age) are
+// not ParseErrors; those surface from [Challenge.Validate] as a
+// *[ValidationError].
 type ParseError struct {
 	// Position is the byte offset into the header value where parsing
 	// failed. Zero-based; points at the offending byte, not past it. For
@@ -61,14 +64,18 @@ func (e *ParseError) Error() string {
 // a max_age outside the configured bounds, and so on. The three fields
 // together identify which rule fired against which field of the Challenge.
 type ValidationError struct {
-	// Rule names the validation rule that fired (e.g.
-	// "recognized-error-code", "non-empty-acr-token",
-	// "max-age-within-bounds"). Stable string suitable for log filtering.
+	// Rule names the validation rule that fired — one of the exported
+	// Rule* identifiers ([RuleErrorCodeRecognized],
+	// [RuleACRValuesNonEmpty], [RuleMaxAgeInBounds]). Stable string
+	// suitable for log filtering and for branching via [errors.As].
 	Rule string
 
-	// Field is the Challenge field name the rule applies to ("ErrorCode",
-	// "ACRValues", "MaxAge", ...). Matches the Go field name, not the
-	// auth-param wire name, so the reader can find the offending code path.
+	// Field is the wire auth-param name the rule applies to ("error",
+	// "acr_values", "max_age") — matching the Param* constants in this
+	// package, not the Go struct field name on [Challenge]. The wire
+	// spelling is used so a single Field value is meaningful to both
+	// Go consumers and operators reading logs alongside the on-wire
+	// header.
 	Field string
 
 	// Reason is a short human-readable description of why the rule failed.
@@ -81,19 +88,26 @@ func (e *ValidationError) Error() string {
 	return fmt.Sprintf("stepup: validation error: rule %s on field %s: %s", e.Rule, e.Field, e.Reason)
 }
 
-// FormatError reports that a Challenge holds a value the WWW-Authenticate
+// FormatError reports that a [Challenge] holds a value the WWW-Authenticate
 // wire format cannot represent — typically a parameter value containing a
 // raw control character, CR, or LF that would break header framing.
-// Returned by the strict marshal variant; the fmt.Stringer formatter is
-// best-effort and does not surface FormatError.
+// Returned by [Challenge.MarshalString]; the [fmt.Stringer] formatter
+// [Challenge.String] is best-effort and substitutes SP rather than
+// surfacing a FormatError.
 type FormatError struct {
-	// Field is the Challenge field name carrying the unrepresentable value
-	// ("Realm", "ErrorDescription", a key from Extra, ...). Matches the Go
-	// field name where applicable.
+	// Field is the wire auth-param name carrying the unrepresentable
+	// value — one of the Param* constants ("realm", "scope", "error",
+	// "error_description", "error_uri", "acr_values") for the seven
+	// spec-defined parameters, or the literal [Challenge.Extra] map key
+	// for extension entries. The wire spelling is used (not the Go
+	// struct field name) so a single Field value is meaningful to both
+	// Go consumers and operators reading logs alongside the on-wire
+	// header.
 	Field string
 
 	// Reason is a short human-readable description of why the value cannot
-	// be formatted.
+	// be formatted, including the offending byte's hex form and zero-based
+	// position within the value.
 	Reason string
 }
 
